@@ -4,6 +4,7 @@ import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { dbg } from "../utils/debugLog.js";
 import { ANTHROPIC_API_VERSION, OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE } from "../providers/shared.js";
 import { resolveOpenAICompatibleApiType } from "../services/provider.js";
+import { randomUUID } from "node:crypto";
 
 /**
  * BaseExecutor - Base class for provider executors
@@ -130,6 +131,19 @@ export class BaseExecutor {
       const headers = this.buildHeaders(credentials, stream, url, model, transformedBody);
       // User per-provider override wins over registry headers (blocked names filtered at the API)
       if (providerOverrides?.headers) Object.assign(headers, providerOverrides.headers);
+
+      // CodeBuddy risk control (11140 "unusual activity"): the 4 ID headers MUST be
+      // unique per request. Static provider-override values get flagged as replay
+      // within days and BAN both accounts. Generate fresh here, per request.
+      // ponytail: per-request conversation id; upgrade to per-client-session if upstream complains.
+      if (this.provider === "codebuddy-intl" || this.provider === "codebuddy-cn") {
+        const uid = () => randomUUID();
+        const noDash = () => randomUUID().replace(/-/g, "");
+        headers["X-Conversation-ID"] = uid();
+        headers["X-Conversation-Request-ID"] = noDash();
+        headers["X-Conversation-Message-ID"] = noDash();
+        headers["X-Request-ID"] = noDash();
+      }
 
       if (!retryAttemptsByUrl[urlIndex]) retryAttemptsByUrl[urlIndex] = 0;
 
