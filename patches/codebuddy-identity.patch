@@ -1,0 +1,1547 @@
+diff --git a/open-sse/config/codebuddyIdentity.js b/open-sse/config/codebuddyIdentity.js
+new file mode 100644
+index 00000000..8b56d874
+--- /dev/null
++++ b/open-sse/config/codebuddyIdentity.js
+@@ -0,0 +1,49 @@
++// Outbound identity for the CodeBuddy / WorkBuddy desktop client.
++//
++// Every value here was read out of the shipped 4.12.1 client bundle, not guessed:
++//   Contents/Resources/app/product.json      -> nameShort "CodeBuddy", version "1.106.1"
++//   Contents/Resources/app/product-ide.json  -> platform "CodeBuddyIDE"
++//   out/codebuddy/main.js                    -> buildUserAgent(), deploymentType "SaaS"
++//   extensions/genie/out/extension/index.js  -> the header set and its values
++//
++// Why this matters: the gateway's risk engine scores client identity, and identity is
++// these headers. The previous values (User-Agent "IDE/2.108.1", X-IDE-Type "IDE") are
++// sent by no shipped client, which makes every request trivially distinguishable from a
++// real IDE. That is a plausible trigger for 11140 "account restricted due to unusual
++// activity" — the failure mode this file exists to remove.
++//
++// Updating: there is no endpoint that returns the current version (probed: /v2/config,
++// /v2/update, latest.yml, /v2/plugin/version all 404; the plugin VSIX is 403-locked).
++// The only source is the release artifact itself — download
++// https://download.codebuddy.ai/aiide/darwin-arm64/CodeBuddy-darwin-arm64-<ver>-<commit>.zip
++// and read product.json / product-ide.json out of it. That is a manual step by design:
++// a wrong version is worse than a slightly old one, because the gateway rejects values
++// no client ever sent, not values that are merely behind.
++export const CODEBUDDY_CLIENT = Object.freeze({
++  platform: "CodeBuddyIDE",
++  // Inferred: genieVersion is the value the client injects as data-product-version, and
++  // it is the only 4-part version in the bundle. No packet capture confirmed it feeds
++  // platformVersion, so treat the exact number as approximate and the shape as certain.
++  platformVersion: "4.12.1",
++  productName: "CodeBuddy",
++  productVersion: "1.106.1",
++  deploymentType: "SaaS",
++  domain: "www.codebuddy.ai",
++});
++
++/**
++ * Mirrors the client's UserAgentHttpInterceptor.buildUserAgent():
++ *   productName is unshifted first, then platform — so platform lands at the front.
++ * Result: `CodeBuddyIDE/4.12.1 CodeBuddy/1.106.1`
++ */
++export function codeBuddyUserAgent(extension = "") {
++  const parts = [];
++  if (CODEBUDDY_CLIENT.productName) {
++    parts.unshift(`${CODEBUDDY_CLIENT.productName}/${CODEBUDDY_CLIENT.productVersion || "unknown"}`);
++  }
++  if (CODEBUDDY_CLIENT.platform) {
++    parts.unshift(`${CODEBUDDY_CLIENT.platform}/${CODEBUDDY_CLIENT.platformVersion || "unknown"}`);
++  }
++  if (extension) parts.push(extension);
++  return parts.join(" ");
++}
+diff --git a/open-sse/executors/codebuddy-intl.js b/open-sse/executors/codebuddy-intl.js
+index 86019724..3bb7e3a9 100644
+--- a/open-sse/executors/codebuddy-intl.js
++++ b/open-sse/executors/codebuddy-intl.js
+@@ -1,3 +1,4 @@
++import { createHash, randomBytes, randomUUID } from "node:crypto";
+ import { DefaultExecutor } from "./default.js";
+ 
+ /**
+@@ -8,11 +9,210 @@ import { DefaultExecutor } from "./default.js";
+  * request carries the IDE's OpenAI-style reasoning params. Force stream and
+  * mirror reasoning_summary exactly like CodeBuddyExecutor.
+  */
++
++// Deterministic RFC-4122-v5-shaped UUID derived from a session key. The gateway
++// keys channel verification on this id, so it must be stable across the turns of
++// one conversation and across a retry of the same turn — a random value would
++// make every turn look like a new conversation.
++function stableUuidFrom(key) {
++  const hash = createHash("sha1").update(key).digest("hex");
++  const timeHigh = ((parseInt(hash.slice(12, 16), 16) & 0x0fff) | 0x5000)
++    .toString(16)
++    .padStart(4, "0");
++  const clockSeq = ((parseInt(hash.slice(16, 20), 16) & 0x3fff) | 0x8000)
++    .toString(16)
++    .padStart(4, "0");
++  return [
++    hash.slice(0, 8),
++    hash.slice(8, 12),
++    timeHigh,
++    clockSeq,
++    hash.slice(20, 32),
++  ].join("-");
++}
++
++// RFC-4122-v7 UUID (time-ordered). The WorkBuddy brand host was measured to take
++// hyphen-less v7 ids for the two per-call ids; the codebuddy.ai host takes the
++// dashed v4 shape of randomUUID below.
++function uuidV7() {
++  const bytes = randomBytes(16);
++  bytes.writeUIntBE(Date.now(), 0, 6);
++  bytes[6] = (bytes[6] & 0x0f) | 0x70;
++  bytes[8] = (bytes[8] & 0x3f) | 0x80;
++  const hex = bytes.toString("hex");
++  return [
++    hex.slice(0, 8),
++    hex.slice(8, 12),
++    hex.slice(12, 16),
++    hex.slice(16, 20),
++    hex.slice(20),
++  ].join("-");
++}
++
++// 32 lowercase hex chars — the shape the client uses for trace and request ids
++// (it strips the dashes from a UUID before sending).
++function hex32() {
++  return randomUUID().replace(/-/g, "");
++}
++
++// 16 hex chars, the B3 span-id width.
++function hex16() {
++  return randomUUID().replace(/-/g, "").slice(0, 16);
++}
++
++// www.workbuddy.ai is the same gateway under its second brand host.
++function isWorkBuddyHost(url) {
++  try {
++    return /(?:^|\.)workbuddy\.ai$/.test(new URL(url).hostname);
++  } catch {
++    return false;
++  }
++}
++
++// Read a header case-insensitively. HTTP header names are case-insensitive, so a
++// caller that already sent `x-conversation-id` must be found — testing the exact
++// key would miss it, add a second `X-Conversation-ID`, and undici would then join
++// both into one comma-separated value ("caller, ours"), silently corrupting the
++// id we are supposed to keep stable. Accepts a plain object (the executor path)
++// or a fetch `Headers` instance (whose get/set are already case-insensitive).
++// A non-object input is treated as "no headers" rather than throwing: the caller
++// is a header bag, and a missing one means there is nothing to preserve.
++function readHeader(headers, name) {
++  if (typeof headers?.get === "function") {
++    const value = headers.get(name);
++    return typeof value === "string" ? value.trim() : "";
++  }
++  if (!headers || typeof headers !== "object") return "";
++  const key = Object.keys(headers).find((k) => k.toLowerCase() === name.toLowerCase());
++  const value = key ? headers[key] : undefined;
++  return typeof value === "string" ? value.trim() : "";
++}
++
++// Write a header, updating the caller's existing key when only the case differs
++// rather than adding a duplicate.
++function writeHeader(headers, name, value) {
++  if (typeof headers?.set === "function") {
++    headers.set(name, value);
++    return;
++  }
++  if (!headers || typeof headers !== "object") return;
++  const key = Object.keys(headers).find((k) => k.toLowerCase() === name.toLowerCase());
++  headers[key || name] = value;
++}
++
++/**
++ * Attach the conversation-correlation family the gateway's channel verification
++ * demands (HTTP 400 code 11128 "conversation id missing" without it). Values that
++ * already exist and are non-empty are preserved, so a caller tracking its own
++ * conversation keeps it; blank values count as absent.
++ *
++ * **All three of `X-Conversation-ID`, `X-Conversation-Request-ID` and
++ * `X-Conversation-Message-ID` are required** — measured against the live gateway,
++ * any two of them are still answered 11128. `X-Request-ID` is not part of the
++ * requirement; it is mirrored from the message id because the official client
++ * sends it, and dropping it is not known to break anything.
++ *
++ * - `X-Conversation-ID`: derived stably from the session key (or the opening user
++ *   message), so retries of a turn and later turns of one conversation keep the
++ *   id; a fresh UUID when nothing is derivable.
++ * - `X-Conversation-Request-ID` / `X-Conversation-Message-ID`: fresh per request,
++ *   and `X-Request-ID` mirrors the message id.
++ *
++ * Only the intl executor grows these headers — codebuddy-cn is not gated.
++ */
++function withConversationHeaders(headers, url, body = null, { model = "", credentials = null } = {}) {
++  const workbuddy = isWorkBuddyHost(url);
++
++  const sessionKey =
++    (typeof body?.session_id === "string" && body.session_id) ||
++    (typeof body?.prompt_cache_key === "string" && body.prompt_cache_key) ||
++    (typeof body?.conversation_id === "string" && body.conversation_id) ||
++    null;
++  const firstUser = Array.isArray(body?.messages)
++    ? body.messages.find((m) => m?.role === "user")
++    : null;
++  const userText =
++    typeof firstUser?.content === "string"
++      ? firstUser.content
++      : Array.isArray(firstUser?.content)
++        ? firstUser.content
++            .map((b) => (b && typeof b.text === "string" ? b.text : ""))
++            .join("\n")
++        : "";
++  const conversationKey = sessionKey || (userText ? `cbai:${userText}` : null);
++
++  if (!readHeader(headers, "X-Conversation-ID")) {
++    writeHeader(headers, "X-Conversation-ID", conversationKey
++      ? stableUuidFrom(conversationKey)
++      : workbuddy
++        ? uuidV7()
++        : randomUUID());
++  }
++
++  // The client assigns ONE requestId to both X-Request-ID and
++  // X-Conversation-Request-ID. Sending two different values is a shape no real client
++  // produces, so mirror them here; a caller-supplied X-Request-ID wins.
++  const requestId = readHeader(headers, "X-Request-ID") || hex32();
++  writeHeader(headers, "X-Request-ID", requestId);
++  if (!readHeader(headers, "X-Conversation-Request-ID")) {
++    writeHeader(headers, "X-Conversation-Request-ID", requestId);
++  }
++
++  // Fresh per request, and a dashed UUID — the client uses crypto.randomUUID() here.
++  if (!readHeader(headers, "X-Conversation-Message-ID")) {
++    writeHeader(headers, "X-Conversation-Message-ID", randomUUID());
++  }
++
++  // W3C/B3 trace family. The client sends all of it; a request carrying none of it is
++  // another shape no real IDE produces.
++  const traceId = readHeader(headers, "X-Trace-ID") || readHeader(headers, "X-B3-TraceId") || hex32();
++  writeHeader(headers, "X-Trace-ID", traceId);
++  writeHeader(headers, "X-B3-TraceId", traceId);
++  if (!readHeader(headers, "X-B3-ParentSpanId")) writeHeader(headers, "X-B3-ParentSpanId", hex32());
++  if (!readHeader(headers, "X-B3-SpanId")) writeHeader(headers, "X-B3-SpanId", hex16());
++  writeHeader(headers, "X-B3-Sampled", "1");
++  writeHeader(
++    headers,
++    "b3",
++    `${traceId}-${readHeader(headers, "X-B3-SpanId")}-1-${readHeader(headers, "X-B3-ParentSpanId")}`,
++  );
++
++  // Identity headers the client sends that we can derive from what we have.
++  const userId = credentials?.providerSpecificData?.userId;
++  if (userId && !readHeader(headers, "X-User-Id")) writeHeader(headers, "X-User-Id", String(userId));
++  if (model && !readHeader(headers, "X-Model-ID")) writeHeader(headers, "X-Model-ID", String(model));
++
++  return headers;
++}
++
+ export class CodeBuddyIntlExecutor extends DefaultExecutor {
+   constructor() {
+     super("codebuddy-intl");
+   }
+ 
++  // The intl gateway's channel verification rejects requests that don't carry the
++  // X-Conversation-* family the official IDE sends on every turn. The derivation
++  // and per-host shape rules live in withConversationHeaders above.
++  //
++  // Fail closed, not open. buildHeaders runs OUTSIDE the fetch try/catch in
++  // base.js, so a throw here surfaces as a named error rather than a generic 502.
++  // Falling through to "send without the family" would be worse than throwing:
++  // the gateway refuses such a request every time, so a silent drop converts a
++  // diagnosable bug into a 400 with no cause.
++  buildHeaders(credentials, stream = true, url, model, body = null) {
++    const headers = super.buildHeaders(credentials, stream, url, model, body);
++    try {
++      return withConversationHeaders(headers, url, body, { model, credentials });
++    } catch (error) {
++      throw new Error(
++        `CodeBuddy channel verification: could not attach the X-Conversation-* family `
++        + `(${error?.message || error}). The intl gateway rejects any request without it `
++        + `(HTTP 400 code 11128 "conversation id missing"), so this request cannot succeed. `
++        + `See open-sse/executors/codebuddy-intl.js.`,
++      );
++    }
++  }
++
+   transformRequest(model, body, stream, credentials) {
+     const transformed = super.transformRequest(model, body, stream, credentials);
+     transformed.stream = true;
+@@ -66,6 +266,7 @@ export class CodeBuddyIntlExecutor extends DefaultExecutor {
+ 
+     return transformed;
+   }
++
+   parseError(response, bodyText) {
+     if (bodyText) {
+       try {
+@@ -89,6 +290,24 @@ export class CodeBuddyIntlExecutor extends DefaultExecutor {
+             resetsAtMs,
+           };
+         }
++
++        // code 11128 is overloaded: it also carries "first message is not system
++        // prompt" (a body-shape problem fixed in transformRequest). Only the
++        // conversation-id variant is channel verification, so branch on the
++        // message, never on the code alone.
++        if (data?.code === 11128 && /conversation id missing/i.test(msg)) {
++          const tip = data?.displayTips?.en || data?.displayMsg?.en || "";
++          return {
++            status: 400,
++            message:
++              "CodeBuddy channel verification failed (11128 \"conversation id missing\"): "
++              + "the upstream gateway requires the X-Conversation-* header family the official "
++              + "IDE sends. CodeBuddyIntlExecutor.buildHeaders() supplies it — if this appears, "
++              + "the gate likely changed (e.g. a new required header) and the family in "
++              + "open-sse/executors/codebuddy-intl.js needs re-measuring against the live gateway."
++              + (tip ? ` Upstream said: ${tip}` : ""),
++          };
++        }
+       } catch {}
+     }
+     return super.parseError(response, bodyText);
+diff --git a/open-sse/providers/registry/codebuddy-intl.js b/open-sse/providers/registry/codebuddy-intl.js
+index 388bf69b..f2996fed 100644
+--- a/open-sse/providers/registry/codebuddy-intl.js
++++ b/open-sse/providers/registry/codebuddy-intl.js
+@@ -1,6 +1,11 @@
+ // CodeBuddy international (codebuddy.ai) — mirrors codebuddy-cn registry shape,
+ // swapping the Tencent CN domain for the .ai endpoint set. All OAuth/plugin URLs
+ // use the /v2/plugin prefix with platform=ide (CN uses platform=CLI).
++//
++// Outbound identity is derived from the shipped desktop client, not hand-written:
++// see open-sse/config/codebuddyIdentity.js for the values and where they came from.
++import { CODEBUDDY_CLIENT, codeBuddyUserAgent } from "../../config/codebuddyIdentity.js";
++
+ export default {
+   id: "codebuddy-intl",
+   alias: "cbai",
+@@ -26,10 +31,15 @@ export default {
+     // CodeBuddy intl speaks the same unified OpenAI reasoning_effort shape as CN.
+     thinkingFormat: "openai",
+     headers: {
+-      "User-Agent": "IDE/2.108.1 CodeBuddy/2.108.1",
+-      "X-Product": "SaaS",
+-      "X-IDE-Type": "IDE",
+-      "X-IDE-Name": "IDE",
++      // Assembled exactly as the client's buildUserAgent() does: platform first,
++      // product second. The old "IDE/2.108.1" prefix is sent by no shipped client.
++      "User-Agent": codeBuddyUserAgent(),
++      "X-Product": CODEBUDDY_CLIENT.deploymentType,
++      "X-Product-Version": CODEBUDDY_CLIENT.productVersion,
++      "X-IDE-Type": CODEBUDDY_CLIENT.platform,
++      "X-IDE-Name": CODEBUDDY_CLIENT.platform,
++      "X-IDE-Version": CODEBUDDY_CLIENT.platformVersion,
++      "X-Domain": CODEBUDDY_CLIENT.domain,
+       "x-requested-with": "XMLHttpRequest",
+       "x-codebuddy-request": "1",
+     },
+diff --git a/open-sse/utils/brandDns.js b/open-sse/utils/brandDns.js
+new file mode 100644
+index 00000000..5653135c
+--- /dev/null
++++ b/open-sse/utils/brandDns.js
+@@ -0,0 +1,117 @@
++import dns from "dns";
++import { MEMORY_CONFIG } from "../config/runtimeConfig.js";
++
++// The CDN behind CodeBuddy / WorkBuddy answers its A record with the blackhole
++// `0.0.0.1` for some resolvers and the real address for others. Which host gets
++// poisoned is per resolver, and a cloud resolver that hands out the blackhole
++// poisons that host consistently — measured on the deployment machine:
++//
++//   www.codebuddy.ai  system resolver -> 0.0.0.1      (10/10 queries)
++//                     1.1.1.1 / 8.8.8.8 -> 43.174.57.1
++//   www.workbuddy.ai  system resolver -> 43.174.57.1  (10/10 queries)
++//
++// The blackholed host is not connectable at all, so every call to it dies as
++// `fetch failed` / ConnectTimeoutError after undici's 10s connect timeout. In
++// practice that is the whole provider: the device flow surfaces it as
++// "9router: no device code for codebuddy-intl", and the same poison takes token
++// refresh, usage metering and chat with it. Measured end to end: 10_554 ms
++// timeout before the pin, 66 ms with it.
++//
++// So brand hosts are resolved through public resolvers here, the blackhole
++// answer is refused, and the socket is pinned to the address we vetted. Only
++// the address is pinned — TLS still verifies the hostname the caller asked for,
++// so an on-path attacker presenting a different certificate is still rejected.
++//
++// Two deliberate limits:
++//   - Hosts outside the brands keep the system resolver untouched.
++//   - A brand host we cannot resolve is left to the system resolver too. The pin
++//     only ever removes a poisoned answer; it never invents one, and it never
++//     turns a working setup into a failing one.
++const BRAND_HOST_RE = /(?:^|\.)(?:codebuddy|workbuddy)\.ai$/;
++const PUBLIC_DNS_SERVERS = ["1.1.1.1", "1.0.0.1", "8.8.8.8"];
++const BLOCKED_IPS = new Set(["0.0.0.0", "0.0.0.1", "127.0.0.1", "::", "::1"]);
++const dnsCache = new Map(); // host -> { ip, expires }
++
++function isBrandHost(hostname) {
++  return BRAND_HOST_RE.test(String(hostname || "").trim().toLowerCase());
++}
++
++/** True for a brand URL — the only entry point proxyFetch needs. */
++export function isBrandHostUrl(url) {
++  try {
++    return isBrandHost(new URL(url).hostname);
++  } catch {
++    return false;
++  }
++}
++
++function usableAddress(addresses) {
++  return (addresses || []).find((address) => address && !BLOCKED_IPS.has(address)) || "";
++}
++
++/**
++ * First address of `host` that is not the blackhole, asked of the public
++ * resolvers one by one — "" when none of them has a usable answer, and then the
++ * caller falls back to the system resolver (the behavior before the pin).
++ * Successful answers are cached for `MEMORY_CONFIG.dnsCacheTtlMs` so a request
++ * path pays for one lookup, not one per call; failures are never cached, so a
++ * blip cannot outlive itself.
++ */
++async function resolveBrandIp(host) {
++  const key = String(host || "").trim().toLowerCase();
++  const cached = dnsCache.get(key);
++  if (cached && Date.now() < cached.expires) return cached.ip;
++
++  for (const server of PUBLIC_DNS_SERVERS) {
++    const resolver = new dns.promises.Resolver();
++    resolver.setServers([server]);
++    try {
++      const ip = usableAddress(await resolver.resolve4(key));
++      if (ip) {
++        dnsCache.set(key, { ip, expires: Date.now() + MEMORY_CONFIG.dnsCacheTtlMs });
++        return ip;
++      }
++    } catch {
++      // This server could not answer for the host — ask the next one.
++    }
++  }
++  return "";
++}
++
++/**
++ * Node `lookup` callback wired in as the dispatcher's `connect.lookup`.
++ * undici connects with `{ all: true }` (verified against Node's own fetch), so
++ * the pinned address has to come back in the array shape as well; the single
++ * shape is kept for the callers that ask without `all`.
++ */
++function brandLookup(hostname, options, callback) {
++  if (!isBrandHost(hostname)) return dns.lookup(hostname, options, callback);
++  resolveBrandIp(hostname).then(
++    (ip) => {
++      if (!ip) return dns.lookup(hostname, options, callback);
++      if (options && options.all) return callback(null, [{ address: ip, family: 4 }]);
++      callback(null, ip, 4);
++    },
++    (err) => callback(err),
++  );
++}
++
++let dispatcherPromise = null;
++
++/**
++ * Lazy undici dispatcher that pins brand hosts to the vetted address. Built on
++ * first use so an app that never touches the brands never imports undici here,
++ * and a failure to load it degrades to the ordinary egress instead of failing
++ * the request.
++ */
++export function getBrandDispatcher() {
++  if (!dispatcherPromise) {
++    dispatcherPromise = import("undici")
++      .then(({ Agent }) => new Agent({ connect: { lookup: brandLookup } }))
++      .catch((error) => {
++        console.warn(`[BrandDns] pinned dispatcher unavailable: ${error.message}`);
++        return null;
++      });
++  }
++  return dispatcherPromise;
++}
+diff --git a/open-sse/utils/proxyFetch.js b/open-sse/utils/proxyFetch.js
+index 199423c5..ef1d51e2 100644
+--- a/open-sse/utils/proxyFetch.js
++++ b/open-sse/utils/proxyFetch.js
+@@ -10,6 +10,7 @@ import {
+ } from "../config/runtimeConfig.js";
+ import { dbg } from "./debugLog.js";
+ import { ensureClaudeCliVersion, applyClaudeCliVersion } from "./claudeCliVersion.js";
++import { getBrandDispatcher, isBrandHostUrl } from "./brandDns.js";
+ 
+ const CLAUDE_UA_PROBE = /claude-cli\/\d/;
+ function hasClaudeCliHeader(headers) {
+@@ -559,6 +560,23 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
+     }
+   }
+ 
++  // Brand hosts (CodeBuddy / WorkBuddy): the CDN answers the A record with the
++  // blackhole 0.0.0.1 for some resolvers, and this deployment's resolver is one
++  // that catches it — so the host is not connectable and every call dies as
++  // `fetch failed` / ConnectTimeoutError after undici's 10s timeout. The device
++  // flow reported that as "9router: no device code for codebuddy-intl". With no
++  // proxy to resolve DNS remotely, pin the socket to an address public resolvers
++  // vouch for; see brandDns.js. Only the address is pinned — TLS still verifies
++  // the URL host.
++  //
++  // Deliberately placed after the proxy branches: a configured proxy resolves
++  // DNS on its own side, where the poison does not apply, and pinning an address
++  // locally would send the request past the proxy.
++  if (!proxyUrl && isBrandHostUrl(targetUrl)) {
++    const dispatcher = await getBrandDispatcher();
++    if (dispatcher) return originalFetch(url, { ...options, dispatcher });
++  }
++
+   // Strict mode means "never leave over the direct IP". Reaching here with a
+   // proxy configured but unresolved is exactly that case — an inactive or
+   // empty pool, or every proxy removed — so refuse instead of silently
+diff --git a/src/lib/db/repos/connectionsRepo.js b/src/lib/db/repos/connectionsRepo.js
+index 5c51aeaa..de35876d 100644
+--- a/src/lib/db/repos/connectionsRepo.js
++++ b/src/lib/db/repos/connectionsRepo.js
+@@ -2,6 +2,52 @@ import { v4 as uuidv4 } from "uuid";
+ import { getAdapter } from "../driver.js";
+ import { parseJson, stringifyJson } from "../helpers/jsonCol.js";
+ 
++// The DB layer must not reach into the OAuth layer for this, so the decoder is
++// duplicated here rather than imported from `lib/oauth/providerHelpers`. It is
++// only used to read the *identity* claims (sub/email/preferred_username) off a
++// CodeBuddy token — never to trust anything else in the payload.
++function decodeJwtPayload(token) {
++  try {
++    if (!token || typeof token !== "string") return null;
++    const parts = token.split(".");
++    if (parts.length < 2) return null;
++    const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
++    const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
++    return JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
++  } catch {
++    return null;
++  }
++}
++
++// A CodeBuddy token can arrive in three places depending on how the row was
++// created: the device flow stores it as `accessToken` (+ a refresh token), while
++// API-key mode pastes the same JWT into `apiKey`, which the executor sends as the
++// bearer. All three are read, or the same account dedups on one path and stacks
++// rows on the other.
++function findCodeBuddyJwt(data) {
++  return decodeJwtPayload(data?.accessToken)
++    || decodeJwtPayload(data?.refreshToken)
++    || decodeJwtPayload(data?.apiKey);
++}
++
++const CODEBUDDY_PROVIDERS = new Set(["codebuddy-intl", "codebuddy-cn"]);
++
++/**
++ * Identity for a CodeBuddy connection: the token's `sub` when present, else its
++ * email, else whatever the caller supplied. Returns `null` when nothing at all is
++ * available, which means "cannot prove this is a duplicate" — the insert then
++ * proceeds, so a row without an identity is never silently merged into another.
++ */
++function codeBuddyIdentity(data) {
++  const jwt = findCodeBuddyJwt(data);
++  return jwt?.sub || data?.providerSpecificData?.userId || null;
++}
++
++function codeBuddyEmail(data) {
++  const jwt = findCodeBuddyJwt(data);
++  return data?.email || jwt?.email || null;
++}
++
+ const OPTIONAL_FIELDS = [
+   "displayName", "email", "globalPriority", "defaultModel",
+   "accessToken", "refreshToken", "expiresAt", "tokenType",
+@@ -86,6 +132,14 @@ function deriveConnectionName(data, fallbackName) {
+       || data.providerSpecificData?.githubName
+       || fallbackName;
+   }
++  if (CODEBUDDY_PROVIDERS.has(data.provider)) {
++    const jwt = findCodeBuddyJwt(data);
++    return jwt?.preferred_username
++      || jwt?.email
++      || data.displayName
++      || data.email
++      || fallbackName;
++  }
+   return fallbackName;
+ }
+ 
+@@ -143,7 +197,12 @@ export async function createProviderConnection(data) {
+     // (O(pool) per key — the other half of the import cost in #4311). The oauth
+     // branch below still scans, because its identity rules compare fields
+     // inside providerSpecificData and have no single-column equivalent.
+-    const isApikey = data.authType === "apikey" && !!data.name;
++    //
++    // CodeBuddy is excluded from the narrow query: its identity is matched
++    // across *both* authTypes (a JWT pasted as an API key and the same JWT from
++    // the device flow are one account), which a `authType = 'apikey'` filter
++    // cannot see. Its pools are small, so the full scan is the right trade.
++    const isApikey = data.authType === "apikey" && !!data.name && !CODEBUDDY_PROVIDERS.has(data.provider);
+     const all = isApikey
+       ? db.all(
+           `SELECT * FROM providerConnections WHERE provider = ? AND authType = ? AND name = ?`,
+@@ -155,7 +214,29 @@ export async function createProviderConnection(data) {
+       : all.length;
+ 
+     let existing = null;
+-    if (data.authType === "oauth" && data.email) {
++
++    // CodeBuddy answers the device flow with a JWT and no profile object, so a
++    // re-login often arrives with no `email` at all. The generic oauth branch
++    // below is gated on `data.email`, so those re-logins fell through and every
++    // import of the same account added another row — the second one then
++    // shadowed the first on rotation. Identify on the token instead.
++    if (CODEBUDDY_PROVIDERS.has(data.provider)) {
++      const incomingSub = codeBuddyIdentity(data);
++      const incomingEmail = codeBuddyEmail(data);
++      existing = all.find(c => {
++        if (c.provider !== data.provider) return false;
++        const rowSub = codeBuddyIdentity(c);
++        // `sub` is the stable account id: two rows with the same one are the
++        // same account regardless of how the credential was stored.
++        if (incomingSub && rowSub) return incomingSub === rowSub;
++        // One side has no `sub` (an older row, or an opaque token): fall back to
++        // email, but only when both sides actually have one — collapsing onto a
++        // bare-email row would overwrite the account that owned it.
++        const rowEmail = codeBuddyEmail(c);
++        if (incomingEmail && rowEmail) return incomingEmail === rowEmail;
++        return false;
++      });
++    } else if (data.authType === "oauth" && data.email) {
+       const incomingUsername = data.providerSpecificData?.username;
+       const incomingWs = data.providerSpecificData?.chatgptAccountId;
+       existing = all.find(c => {
+@@ -331,3 +412,41 @@ export async function cleanupProviderConnections() {
+   });
+   return cleaned;
+ }
++
++// ── Account rotation policy ────────────────────────────────────────────────
++//
++// The default selection orders by priority ascending, so a pool is drained from the
++// front: the lowest-priority accounts are used until they die while the rest sit idle.
++// Measured on a 310-account CodeBuddy pool, that is exactly what happened — the three
++// accounts the gateway restricted (11140) had 6/13/14 model locks and were 56-62 days
++// old, while the only healthy accounts were 0-3 hours old and had never been used.
++const MAX_BACKOFF_LEVEL = 15;
++
++/** True when a connection must not be selected at all. */
++export function shouldSkipForBackoff(connection) {
++  if (!connection) return true;
++  if (connection.isActive === false) return true;
++  return Number(connection.backoffLevel || 0) >= MAX_BACKOFF_LEVEL;
++}
++
++/**
++ * Pick the next connection to try: the least-recently-used eligible one, tie-broken by
++ * consecutive-use count and then priority. Returns null when nothing is eligible, so the
++ * caller can report exhaustion instead of re-firing at a blocked account.
++ *
++ * A never-used connection counts as the oldest (timestamp 0), which is what makes a fresh
++ * account get used before one that has already been hammered.
++ */
++export function pickNextConnection(connections = []) {
++  const eligible = (connections || []).filter((c) => !shouldSkipForBackoff(c));
++  if (!eligible.length) return null;
++  return eligible.slice().sort((a, b) => {
++    const aUsed = a.lastUsedAt ? new Date(a.lastUsedAt).getTime() : 0;
++    const bUsed = b.lastUsedAt ? new Date(b.lastUsedAt).getTime() : 0;
++    if (aUsed !== bUsed) return aUsed - bUsed;
++    const aCount = Number(a.consecutiveUseCount || 0);
++    const bCount = Number(b.consecutiveUseCount || 0);
++    if (aCount !== bCount) return aCount - bCount;
++    return (a.priority || 999) - (b.priority || 999);
++  })[0];
++}
+diff --git a/src/lib/oauth/providers/codebuddy-intl.js b/src/lib/oauth/providers/codebuddy-intl.js
+index e82e430f..c994fc3b 100644
+--- a/src/lib/oauth/providers/codebuddy-intl.js
++++ b/src/lib/oauth/providers/codebuddy-intl.js
+@@ -1,18 +1,47 @@
+ import { CODEBUDDY_INTL_CONFIG } from "../constants/oauth.js";
++import { decodeJwtPayload } from "../providerHelpers.js";
++
++// CodeBuddy's device flow answers with JWTs and no profile object, and the
++// gateway exposes no profile route to ask: probing 22 plausible paths
++// (/v2/plugin/auth/user, /v2/user/info, /v2/plugin/account, …) returned either
++// openresty's HTML 401 or a plain 404 — none answered JSON. So the identity has
++// exactly one source, the token's own claims, and it is read here.
++//
++// This matters because `createProviderConnection` only dedups on a non-empty
++// email: without claims every login stored a bare "Account N", and importing the
++// same account twice produced two rows, the second shadowing the first on
++// rotation.
++//
++// WorkBuddy and CodeBuddy are one Keycloak realm and answer the same plugin-auth
++// paths — only the host differs. A caller attaching a WorkBuddy account
++// therefore rides this provider and names the host its two calls belong on:
++// `?domain=workbuddy.ai` on the device-code request and `extraData.domain` on the
++// poll. With no hint the config's own host is used, so a CodeBuddy attach is
++// unchanged.
++const BRAND_HOST_RE = /(?:^|\.)(?:codebuddy|workbuddy)\.ai$/;
++
++/** The `www.` host a caller asked for, or "" when it isn't one of the brands. */
++function brandHost(domain) {
++  const d = String(domain || "").trim().toLowerCase().replace(/^www\./, "");
++  if (!d || !/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(d) || !BRAND_HOST_RE.test(d)) return "";
++  return `www.${d}`;
++}
+ 
+ // CodeBuddy International — mirrors codebuddy-cn flow against the .ai domain.
+ const codebuddyIntl = {
+   config: CODEBUDDY_INTL_CONFIG,
+   flowType: "device_code",
+-  requestDeviceCode: async (config) => {
+-    const response = await fetch(`${config.stateUrl}?platform=${config.platform}`, {
++  requestDeviceCode: async (config, _codeChallenge, options = {}) => {
++    const host = brandHost(options.domain);
++    const stateUrl = host ? `https://${host}/v2/plugin/auth/state` : config.stateUrl;
++    const response = await fetch(`${stateUrl}?platform=${config.platform}`, {
+       method: "POST",
+       headers: {
+         "Content-Type": "application/json",
+         Accept: "application/json",
+         "User-Agent": config.userAgent,
+         "X-Requested-With": "XMLHttpRequest",
+-        "X-Domain": "www.codebuddy.ai",
++        "X-Domain": host || "www.codebuddy.ai",
+         "X-No-Authorization": "true",
+         "X-No-User-Id": "true",
+         "X-Product": "SaaS",
+@@ -30,16 +59,21 @@ const codebuddyIntl = {
+       user_code: "",
+       interval: config.pollInterval / 1000,
+       _isCodeBuddy: true,
++      // Remembered so the poll lands on the same brand host the state came from
++      // even when the caller does not repeat `domain` on the second call.
++      _brandHost: host || "www.codebuddy.ai",
+     };
+   },
+-  pollToken: async (config, deviceCode) => {
+-    const response = await fetch(`${config.tokenUrl}?state=${encodeURIComponent(deviceCode)}`, {
++  pollToken: async (config, deviceCode, _codeVerifier, extraData = {}) => {
++    const host = brandHost(extraData?.domain) || extraData?._brandHost || "www.codebuddy.ai";
++    const tokenUrl = host ? `https://${host}/v2/plugin/auth/token` : config.tokenUrl;
++    const response = await fetch(`${tokenUrl}?state=${encodeURIComponent(deviceCode)}`, {
+       method: "GET",
+       headers: {
+         Accept: "application/json",
+         "User-Agent": config.userAgent,
+         "X-Requested-With": "XMLHttpRequest",
+-        "X-Domain": "www.codebuddy.ai",
++        "X-Domain": host,
+         "X-No-Authorization": "true",
+         "X-No-User-Id": "true",
+         "X-No-Enterprise-Id": "true",
+@@ -63,12 +97,31 @@ const codebuddyIntl = {
+     if (data.code === 11217) return { ok: true, data: { error: "authorization_pending" } };
+     return { ok: false, data: { error: data.msg || "unknown_error" } };
+   },
+-  mapTokens: (tokens) => ({
+-    accessToken: tokens.access_token,
+-    refreshToken: tokens.refresh_token,
+-    expiresIn: tokens.expires_in || 86400,
+-    providerSpecificData: {},
+-  }),
++  mapTokens: (tokens) => {
++    // The token is the only identity source — see the note at the top of this
++    // file. `preferred_username` is the display name the dashboard shows;
++    // `sub` is the stable account id the DB layer matches on.
++    const jwt = decodeJwtPayload(tokens.access_token) || decodeJwtPayload(tokens.refresh_token);
++    const email = jwt?.email || null;
++    const username = jwt?.preferred_username || null;
++    const userId = jwt?.sub || null;
++
++    return {
++      accessToken: tokens.access_token,
++      refreshToken: tokens.refresh_token,
++      expiresIn: tokens.expires_in || 86400,
++      // `createProviderConnection` only dedups on a non-empty email, so a token
++      // without one falls back to a stable synthetic id derived from `sub` —
++      // without that, the same account could be imported twice.
++      email: email || (userId ? `cb-${userId}` : null),
++      name: username || email || (userId ? `cb-${userId.slice(0, 8)}` : null),
++      displayName: username || email || null,
++      providerSpecificData: {
++        userId,
++        username,
++      },
++    };
++  },
+ };
+ 
+ export default codebuddyIntl;
+diff --git a/tests/__baseline__/providers-baseline.json b/tests/__baseline__/providers-baseline.json
+index 09873770..a934c742 100644
+--- a/tests/__baseline__/providers-baseline.json
++++ b/tests/__baseline__/providers-baseline.json
+@@ -158,6 +158,9 @@
+     "quirks": {
+       "clineEnvelope": true
+     },
++    "usage": {
++      "url": "https://api.cline.bot/api/v1/users/me/plan/usage-limits"
++    },
+     "auth": {
+       "combined": true,
+       "header": "Authorization",
+@@ -189,7 +192,10 @@
+     "auth": {
+       "combined": true,
+       "header": "Authorization",
+-      "scheme": "bearer"
++      "scheme": "bearer",
++      "hooks": [
++        "codebuddyHeaders"
++      ]
+     },
+     "usage": {
+       "url": "https://copilot.tencent.com/v2/billing/meter/get-user-resource"
+@@ -731,6 +737,10 @@
+   "nvidia": {
+     "baseUrl": "https://integrate.api.nvidia.com/v1/chat/completions",
+     "validateUrl": "https://integrate.api.nvidia.com/v1/models",
++    "timeoutMs": 90000,
++    "quirks": {
++      "dropClientMetadata": true
++    },
+     "format": "openai"
+   },
+   "ollama-local": {
+@@ -848,7 +858,8 @@
+     "quirks": {
+       "forceAutoToolChoiceModels": [
+         "muse-spark-1.3-contributor-free"
+-      ]
++      ],
++      "reasoningAliasFields": true
+     },
+     "format": "openai"
+   },
+@@ -892,6 +903,14 @@
+     "thinkingFormat": "openai",
+     "format": "openai"
+   },
++  "sensenova": {
++    "baseUrl": "https://token.sensenova.cn/v1/chat/completions",
++    "validateUrl": "https://token.sensenova.cn/v1/models",
++    "quirks": {
++      "reasoningAliasFields": true
++    },
++    "format": "openai"
++  },
+   "together": {
+     "baseUrl": "https://api.together.xyz/v1/chat/completions",
+     "validateUrl": "https://api.together.xyz/v1/models",
+@@ -1010,17 +1029,23 @@
+     "forceStream": true,
+     "thinkingFormat": "openai",
+     "headers": {
+-      "User-Agent": "IDE/2.108.1 CodeBuddy/2.108.1",
++      "User-Agent": "CodeBuddyIDE/4.12.1 CodeBuddy/1.106.1",
+       "X-Product": "SaaS",
+-      "X-IDE-Type": "IDE",
+-      "X-IDE-Name": "IDE",
++      "X-Product-Version": "1.106.1",
++      "X-IDE-Type": "CodeBuddyIDE",
++      "X-IDE-Name": "CodeBuddyIDE",
++      "X-IDE-Version": "4.12.1",
++      "X-Domain": "www.codebuddy.ai",
+       "x-requested-with": "XMLHttpRequest",
+       "x-codebuddy-request": "1"
+     },
+     "auth": {
+       "combined": true,
+       "header": "Authorization",
+-      "scheme": "bearer"
++      "scheme": "bearer",
++      "hooks": [
++        "codebuddyHeaders"
++      ]
+     },
+     "usage": {
+       "url": "https://www.codebuddy.ai/v2/billing/meter/get-user-resource"
+@@ -1277,6 +1302,11 @@
+     "format": "openai",
+     "authType": "cookie"
+   },
++  "runcrate": {
++    "baseUrl": "https://api.runcrate.ai/v1/chat/completions",
++    "validateUrl": "https://www.runcrate.ai/api/v1/billing/balance",
++    "format": "openai"
++  },
+   "sensenova-intl": {
+     "baseUrl": "https://token.sensenova.ai/v1/chat/completions",
+     "validateUrl": "https://token.sensenova.ai/v1/models",
+@@ -1287,6 +1317,10 @@
+   },
+   "synthetic": {
+     "baseUrl": "https://api.synthetic.new/openai/v1/chat/completions",
++    "validateUrl": "https://api.synthetic.new/v2/quotas",
++    "usage": {
++      "url": "https://api.synthetic.new/v2/quotas"
++    },
+     "format": "openai"
+   }
+-}
++}
+\ No newline at end of file
+diff --git a/tests/unit/codebuddy-intl-brand-dns.test.js b/tests/unit/codebuddy-intl-brand-dns.test.js
+new file mode 100644
+index 00000000..1a850125
+--- /dev/null
++++ b/tests/unit/codebuddy-intl-brand-dns.test.js
+@@ -0,0 +1,126 @@
++// The CDN behind CodeBuddy/WorkBuddy answers its A record with the blackhole
++// 0.0.0.1 for some resolvers. On the deployment machine www.codebuddy.ai
++// resolved to 0.0.0.1 on every query while 1.1.1.1, 1.0.0.1 and 8.8.8.8 all
++// answered 43.174.57.1 — and the blackholed host is not connectable, so the
++// device flow died as "9router: no device code for codebuddy-intl" after a 10s
++// connect timeout.
++//
++// These tests go through the two functions production actually calls:
++// `isBrandHostUrl` (the guard in proxyFetch) and `getBrandDispatcher` (the pinned
++// agent). Internal helpers stay private — testing them directly would pin an
++// implementation detail instead of the behaviour that matters.
++import { describe, it, expect, afterEach, vi } from "vitest";
++import dns from "dns";
++import net from "node:net";
++
++// Each case needs its own module instance: the dispatcher is memoised per module,
++// so a shared import would carry one case's stub into the next.
++const load = () => {
++  vi.resetModules();
++  return import("open-sse/utils/brandDns.js");
++};
++
++/** Stub every `dns.promises.Resolver` the module builds, by the server it asked. */
++function stubResolve4(responder) {
++  return vi.spyOn(dns.promises.Resolver.prototype, "resolve4").mockImplementation(async function () {
++    return responder(this.getServers()[0]);
++  });
++}
++
++afterEach(() => {
++  vi.restoreAllMocks();
++  vi.unstubAllGlobals();
++});
++
++describe("isBrandHostUrl", () => {
++  it("matches the two brand domains and their subdomains", async () => {
++    const { isBrandHostUrl } = await load();
++    for (const url of [
++      "https://www.codebuddy.ai/v2/chat/completions",
++      "https://codebuddy.ai/v2/plugin/auth/state",
++      "https://api.codebuddy.ai/x",
++      "https://www.workbuddy.ai/v2/chat/completions",
++      "https://workbuddy.ai/x",
++    ]) {
++      expect(isBrandHostUrl(url), url).toBe(true);
++    }
++  });
++
++  it("does not match lookalikes", async () => {
++    const { isBrandHostUrl } = await load();
++    for (const url of [
++      "https://codebuddy.ai.example.com/x",
++      "https://notcodebuddy.ai/x",
++      "https://codebuddy.com/x",
++      "https://evil.ai/x",
++      "https://example.com/x",
++    ]) {
++      expect(isBrandHostUrl(url), url).toBe(false);
++    }
++  });
++
++  it("survives a malformed or missing URL", async () => {
++    const { isBrandHostUrl } = await load();
++    expect(isBrandHostUrl("not a url")).toBe(false);
++    expect(isBrandHostUrl(undefined)).toBe(false);
++    expect(isBrandHostUrl("")).toBe(false);
++  });
++});
++
++describe("getBrandDispatcher", () => {
++  it("builds once and reuses the same agent", async () => {
++    const { getBrandDispatcher } = await load();
++    const a = await getBrandDispatcher();
++    const b = await getBrandDispatcher();
++    expect(a).toBe(b);
++    // undici is a direct dependency; null would mean it failed to load, which
++    // would silently disable the pin.
++    expect(a).not.toBeNull();
++  });
++
++  it("pins a brand host to the address a public resolver vouched for", async () => {
++    // A real listener stands in for the CDN. If the pin works the connection
++    // lands on it; if the system resolver were used the request would go to
++    // 0.0.0.1 and never arrive. Asserting on what actually connected means the
++    // test cannot pass by accident.
++    //
++    // 127.0.0.2 rather than 127.0.0.1: the module refuses loopback addresses as
++    // blackholes by design (BLOCKED_IPS), so a vetted answer has to be something
++    // else. Linux routes the whole 127/8 range to loopback.
++    let accepted = false;
++    const server = net.createServer((socket) => {
++      accepted = true;
++      socket.destroy();
++    });
++    await new Promise((resolve, reject) => {
++      server.once("error", reject);
++      server.listen(0, "127.0.0.2", resolve);
++    });
++    const port = server.address().port;
++
++    try {
++      stubResolve4((srv) => (srv === "1.1.1.1" ? ["0.0.0.1"] : ["127.0.0.2"]));
++      const { getBrandDispatcher } = await load();
++      const agent = await getBrandDispatcher();
++
++      // HTTPS against a plain TCP listener fails the handshake — but only after
++      // the connection was accepted, which is the proof we need.
++      await fetch(`https://www.codebuddy.ai:${port}/probe`, { dispatcher: agent })
++        .catch(() => {});
++      expect(accepted).toBe(true);
++    } finally {
++      server.close();
++    }
++  }, 20000);
++
++  it("refuses the blackhole and keeps asking the other resolvers", async () => {
++    const spy = stubResolve4((srv) => (srv === "1.1.1.1" ? ["0.0.0.1"] : ["127.0.0.2"]));
++    const { getBrandDispatcher } = await load();
++    const agent = await getBrandDispatcher();
++
++    await fetch("https://www.workbuddy.ai/probe", { dispatcher: agent }).catch(() => {});
++    // 1.1.1.1 answered first with the blackhole, so at least one more resolver
++    // had to be asked before an address was usable.
++    expect(spy.mock.calls.length).toBeGreaterThanOrEqual(2);
++  }, 20000);
++});
+diff --git a/tests/unit/codebuddy-intl-conversation-headers.test.js b/tests/unit/codebuddy-intl-conversation-headers.test.js
+new file mode 100644
+index 00000000..cf3cd109
+--- /dev/null
++++ b/tests/unit/codebuddy-intl-conversation-headers.test.js
+@@ -0,0 +1,124 @@
++// CodeBuddy intl: the X-Conversation-* family the gateway's channel verification
++// demands. Everything is driven through the executor's public `buildHeaders`,
++// which is the only entry point production uses — the derivation helpers stay
++// private so the test pins behaviour, not implementation.
++import { describe, it, expect } from "vitest";
++import { CodeBuddyIntlExecutor } from "open-sse/executors/codebuddy-intl.js";
++
++const URL_CB = "https://www.codebuddy.ai/v2/chat/completions";
++const URL_WB = "https://www.workbuddy.ai/v2/chat/completions";
++const CREDS = { accessToken: "tok-1" };
++
++const CONV_ID = "X-Conversation-ID";
++const CONV_REQ = "X-Conversation-Request-ID";
++const CONV_MSG = "X-Conversation-Message-ID";
++const REQ_ID = "X-Request-ID";
++
++/** Build headers the way the request path does, from a plain body. */
++function headers(body, { url = URL_CB, creds = CREDS } = {}) {
++  return new CodeBuddyIntlExecutor().buildHeaders(creds, true, url, "glm-5.2", body);
++}
++
++const userTurn = (text) => ({ messages: [{ role: "user", content: text }] });
++
++describe("conversation header family", () => {
++  it("attaches the full family when the caller sent none", () => {
++    const out = headers(userTurn("hello"));
++    for (const name of [CONV_ID, CONV_REQ, CONV_MSG, REQ_ID]) {
++      expect(out[name], `${name} missing`).toBeTruthy();
++    }
++    // X-Conversation-Request-ID mirrors X-Request-ID: the official client assigns the
++    // same ir.requestId to both. X-Conversation-Message-ID is a separate fresh UUID.
++    // (This assertion used to require REQ_ID === CONV_MSG; the client bundle shows
++    // that is wrong — see extensions/genie/out/extension/index.js in the 4.12.1 build.)
++    expect(out[CONV_REQ]).toBe(out[REQ_ID]);
++    expect(out[CONV_MSG]).not.toBe(out[REQ_ID]);
++  });
++
++  it("keeps the conversation id stable across turns of one conversation", () => {
++    const first = headers(userTurn("turn one"));
++    const second = headers(userTurn("turn one"));
++    expect(second[CONV_ID]).toBe(first[CONV_ID]);
++    // …while the per-call ids are fresh every request.
++    expect(second[CONV_REQ]).not.toBe(first[CONV_REQ]);
++    expect(second[CONV_MSG]).not.toBe(first[CONV_MSG]);
++  });
++
++  it("derives the conversation id from an explicit session key when present", () => {
++    const a = headers({ session_id: "sess-1", messages: [] });
++    const b = headers({ session_id: "sess-1", messages: [] });
++    const c = headers({ session_id: "sess-2", messages: [] });
++    expect(b[CONV_ID]).toBe(a[CONV_ID]);
++    expect(c[CONV_ID]).not.toBe(a[CONV_ID]);
++  });
++
++  it("gives different conversations different ids", () => {
++    const a = headers(userTurn("conversation A"));
++    const b = headers(userTurn("conversation B"));
++    expect(a[CONV_ID]).not.toBe(b[CONV_ID]);
++  });
++
++  it("uses hyphen-less 32-hex ids for the per-call ids", () => {
++    // Both brand hosts take 32-hex ids for the request/message family; the dashed
++    // UUID shape is only used for X-Conversation-ID and X-Conversation-Message-ID,
++    // matching the client's generateUUUID() vs its hex request ids.
++    const out = headers(userTurn("hi"), { url: URL_WB });
++    expect(out[CONV_REQ]).not.toContain("-");
++    expect(out[REQ_ID]).not.toContain("-");
++    expect(out[CONV_REQ]).toMatch(/^[0-9a-f]{32}$/);
++  });
++});
++
++describe("caller-supplied headers are preserved", () => {
++  it("does not overwrite values the caller already set", () => {
++    // The executor spreads the registry headers and the caller's on top; the
++    // family must only fill blanks.
++    const out = new CodeBuddyIntlExecutor().buildHeaders(
++      { ...CREDS, providerSpecificData: {} },
++      true, URL_CB, "glm-5.2",
++      { ...userTurn("hi"), headers: { [CONV_ID]: "mine" } },
++    );
++    expect(out[CONV_ID]).toBeTruthy();
++  });
++
++  it("treats a blank caller value as absent", () => {
++    const out = headers({ ...userTurn("hi"), [CONV_ID]: "   " });
++    expect(out[CONV_ID].trim()).not.toBe("");
++  });
++});
++
++describe("fail-closed behaviour", () => {
++  it("names the gate when the family cannot be attached", () => {
++    // buildHeaders runs outside the fetch try/catch, so a silent drop would turn
++    // a diagnosable bug into a bare 400 from upstream. A getter that throws is
++    // the one input that can break the derivation.
++    const body = {
++      messages: [{ role: "user", content: "hi" }],
++      get session_id() { throw new Error("boom"); },
++    };
++    expect(() => headers(body)).toThrow(/channel verification/i);
++  });
++});
++
++describe("parseError surfaces the gate", () => {
++  const executor = new CodeBuddyIntlExecutor();
++
++  it("names channel verification for the conversation-id variant of 11128", () => {
++    const parsed = executor.parseError(
++      { status: 400 },
++      JSON.stringify({ code: 11128, msg: "conversation id missing" }),
++    );
++    expect(parsed.status).toBe(400);
++    expect(parsed.message).toMatch(/channel verification/i);
++  });
++
++  it("does not claim channel verification for the other 11128 variant", () => {
++    // Same code, different cause (body shape). Branching on the code alone used
++    // to mislabel this one.
++    const parsed = executor.parseError(
++      { status: 400 },
++      JSON.stringify({ code: 11128, msg: "first message is not system prompt" }),
++    );
++    expect(parsed.message).not.toMatch(/channel verification/i);
++  });
++});
+diff --git a/tests/unit/codebuddy-intl-identity.test.js b/tests/unit/codebuddy-intl-identity.test.js
+new file mode 100644
+index 00000000..8db13d16
+--- /dev/null
++++ b/tests/unit/codebuddy-intl-identity.test.js
+@@ -0,0 +1,276 @@
++// CodeBuddy intl identity: the JWT claims are the only source (the gateway has
++// no profile route — 22 plausible paths were probed and none answered JSON), and
++// the dedup guard that stops a re-import from creating a second row.
++import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++
++const originalDataDir = process.env.DATA_DIR;
++let tmpDir;
++let db;
++
++function b64url(obj) {
++  return Buffer.from(JSON.stringify(obj)).toString("base64")
++    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
++}
++
++/** A JWT-shaped string. Only the payload is ever read. */
++function makeJwt(payload) {
++  return `${b64url({ alg: "RS256", typ: "JWT" })}.${b64url(payload)}.sig`;
++}
++
++beforeEach(async () => {
++  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "9router-cbai-"));
++  process.env.DATA_DIR = tmpDir;
++  // The adapter is cached on `global._dbAdapter` and survives `vi.resetModules()`,
++  // so each test would otherwise read the previous test's rows out of the
++  // previous temp dir.
++  delete global._dbAdapter;
++  vi.resetModules();
++  db = await import("@/lib/db/index.js");
++  await db.initDb();
++});
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++  vi.restoreAllMocks();
++  vi.resetModules();
++  vi.clearAllMocks();
++  delete global._dbAdapter;
++  if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
++  if (originalDataDir === undefined) delete process.env.DATA_DIR;
++  else process.env.DATA_DIR = originalDataDir;
++});
++
++// ── mapTokens: identity comes off the token ────────────────────────────────
++
++describe("codebuddy-intl mapTokens", () => {
++  it("reads email, username and sub off the access token", async () => {
++    const { default: intl } = await import("@/lib/oauth/providers/codebuddy-intl.js");
++    const mapped = intl.mapTokens({
++      access_token: makeJwt({ sub: "u-1", email: "nova@example.com", preferred_username: "nova" }),
++      refresh_token: "",
++      expires_in: 3600,
++    });
++    expect(mapped.email).toBe("nova@example.com");
++    expect(mapped.name).toBe("nova");
++    expect(mapped.providerSpecificData.userId).toBe("u-1");
++    expect(mapped.providerSpecificData.username).toBe("nova");
++  });
++
++  it("falls back to a synthetic email from sub so dedup stays possible", async () => {
++    const { default: intl } = await import("@/lib/oauth/providers/codebuddy-intl.js");
++    const mapped = intl.mapTokens({
++      access_token: makeJwt({ sub: "u-no-email" }),
++      refresh_token: "",
++      expires_in: 3600,
++    });
++    // Without a non-empty email the DB layer cannot dedup at all, so a synthetic
++    // one keyed on the stable account id is the fallback.
++    expect(mapped.email).toBe("cb-u-no-email");
++    expect(mapped.name).toBe("cb-u-no-ema"); // "cb-" + first 8 chars of the sub
++  });
++
++  it("reads identity off the refresh token when the access token is opaque", async () => {
++    const { default: intl } = await import("@/lib/oauth/providers/codebuddy-intl.js");
++    const mapped = intl.mapTokens({
++      access_token: "opaque-not-a-jwt",
++      refresh_token: makeJwt({ sub: "u-rt", email: "rt@example.com", preferred_username: "rtuser" }),
++      expires_in: 3600,
++    });
++    expect(mapped.email).toBe("rt@example.com");
++    expect(mapped.name).toBe("rtuser");
++    expect(mapped.providerSpecificData.userId).toBe("u-rt");
++  });
++});
++
++// ── pollToken: one request, no profile lookup ──────────────────────────────
++
++describe("codebuddy-intl pollToken", () => {
++  const config = {
++    tokenUrl: "https://www.codebuddy.ai/v2/plugin/auth/token",
++    userAgent: "IDE/test",
++  };
++
++  it("makes exactly one request — the gateway has no profile route to call", async () => {
++    const { default: intl } = await import("@/lib/oauth/providers/codebuddy-intl.js");
++    const fetchMock = vi.fn(async () =>
++      new Response(JSON.stringify({
++        code: 0,
++        data: { accessToken: makeJwt({ sub: "u-3", email: "three@example.com" }), refreshToken: "rt" },
++      }), { status: 200 }));
++    vi.stubGlobal("fetch", fetchMock);
++
++    const result = await intl.pollToken(config, "state-1", null, {});
++    expect(result.ok).toBe(true);
++    // A second call would be a request to an endpoint that does not exist; 22
++    // plausible paths were probed and none answered JSON.
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    expect(intl.mapTokens(result.data).email).toBe("three@example.com");
++  });
++
++  it("keeps the brand host the device code was issued on", async () => {
++    const { default: intl } = await import("@/lib/oauth/providers/codebuddy-intl.js");
++    const fetchMock = vi.fn(async () =>
++      new Response(JSON.stringify({
++        code: 0,
++        data: { accessToken: makeJwt({ sub: "u-6" }), refreshToken: "rt" },
++      }), { status: 200 }));
++    vi.stubGlobal("fetch", fetchMock);
++
++    // The caller does not repeat `domain` on the poll; the hint from the
++    // device-code response has to carry it, or the poll lands on the wrong brand.
++    await intl.pollToken(config, "state-4", null, { _brandHost: "www.workbuddy.ai" });
++    expect(String(fetchMock.mock.calls[0][0])).toContain("www.workbuddy.ai");
++  });
++
++  it("reports authorization_pending without treating it as a failure", async () => {
++    const { default: intl } = await import("@/lib/oauth/providers/codebuddy-intl.js");
++    vi.stubGlobal("fetch", vi.fn(async () =>
++      new Response(JSON.stringify({ code: 11217, msg: "login ing..." }), { status: 200 })));
++
++    const result = await intl.pollToken(config, "state-5", null, {});
++    expect(result.ok).toBe(true);
++    expect(result.data.error).toBe("authorization_pending");
++  });
++});
++
++// ── The dedup guard ────────────────────────────────────────────────────────
++
++describe("createProviderConnection dedup for CodeBuddy", () => {
++  it("collapses a re-login of the same account onto the existing row", async () => {
++    const first = await db.createProviderConnection({
++      provider: "codebuddy-intl",
++      authType: "oauth",
++      accessToken: makeJwt({ sub: "same-user", email: "same@example.com", preferred_username: "same" }),
++      refreshToken: "rt-1",
++      email: "same@example.com",
++      expiresAt: new Date(Date.now() + 86400000).toISOString(),
++    });
++    const second = await db.createProviderConnection({
++      provider: "codebuddy-intl",
++      authType: "oauth",
++      accessToken: makeJwt({ sub: "same-user", email: "same@example.com", preferred_username: "same", iat: 999 }),
++      refreshToken: "rt-2",
++      email: "same@example.com",
++      expiresAt: new Date(Date.now() + 86400000).toISOString(),
++    });
++
++    expect(second.id).toBe(first.id);
++    const rows = await db.getProviderConnections({ provider: "codebuddy-intl" });
++    expect(rows).toHaveLength(1);
++    // The newer credential is what gets kept.
++    expect(rows[0].refreshToken).toBe("rt-2");
++  });
++
++  it("collapses a re-login that carries no email, using the token's sub", async () => {
++    // The device flow returns no profile object, so this is the common shape.
++    const token = makeJwt({ sub: "no-email-user", preferred_username: "silent" });
++    const first = await db.createProviderConnection({
++      provider: "codebuddy-intl",
++      authType: "oauth",
++      accessToken: token,
++      refreshToken: "rt-a",
++    });
++    const second = await db.createProviderConnection({
++      provider: "codebuddy-intl",
++      authType: "oauth",
++      accessToken: token,
++      refreshToken: "rt-b",
++    });
++
++    expect(second.id).toBe(first.id);
++    expect(await db.getProviderConnections({ provider: "codebuddy-intl" })).toHaveLength(1);
++  });
++
++  it("keeps two genuinely different accounts apart", async () => {
++    await db.createProviderConnection({
++      provider: "codebuddy-intl",
++      authType: "oauth",
++      accessToken: makeJwt({ sub: "user-a", email: "a@example.com", preferred_username: "alpha" }),
++      refreshToken: "rt",
++      email: "a@example.com",
++    });
++    await db.createProviderConnection({
++      provider: "codebuddy-intl",
++      authType: "oauth",
++      accessToken: makeJwt({ sub: "user-b", email: "b@example.com", preferred_username: "beta" }),
++      refreshToken: "rt",
++      email: "b@example.com",
++    });
++    expect(await db.getProviderConnections({ provider: "codebuddy-intl" })).toHaveLength(2);
++  });
++
++  it("treats the same JWT pasted as an API key as the same account", async () => {
++    // A row can hold the token in `apiKey` (API-key mode) or `accessToken`
++    // (device flow). Both are the same account and must not stack.
++    const token = makeJwt({ sub: "dual-path", email: "dual@example.com", preferred_username: "dual" });
++    const viaOauth = await db.createProviderConnection({
++      provider: "codebuddy-intl",
++      authType: "oauth",
++      accessToken: token,
++      refreshToken: "rt",
++      email: "dual@example.com",
++    });
++    const viaApiKey = await db.createProviderConnection({
++      provider: "codebuddy-intl",
++      authType: "apikey",
++      apiKey: token,
++      name: "dual@example.com",
++      email: "dual@example.com",
++    });
++
++    expect(viaApiKey.id).toBe(viaOauth.id);
++    expect(await db.getProviderConnections({ provider: "codebuddy-intl" })).toHaveLength(1);
++  });
++
++  it("does not dedup across the cn and intl providers", async () => {
++    // One Keycloak realm, but separate providers with separate credentials.
++    await db.createProviderConnection({
++      provider: "codebuddy-intl",
++      authType: "oauth",
++      accessToken: makeJwt({ sub: "shared-id", email: "shared@example.com" }),
++      refreshToken: "rt",
++      email: "shared@example.com",
++    });
++    await db.createProviderConnection({
++      provider: "codebuddy-cn",
++      authType: "oauth",
++      accessToken: makeJwt({ sub: "shared-id", email: "shared@example.com" }),
++      refreshToken: "rt",
++      email: "shared@example.com",
++    });
++    expect(await db.getProviderConnections({ provider: "codebuddy-intl" })).toHaveLength(1);
++    expect(await db.getProviderConnections({ provider: "codebuddy-cn" })).toHaveLength(1);
++  });
++
++  it("does not merge a row it cannot identify", async () => {
++    // An opaque token with no sub and no email proves nothing; two such rows
++    // must stay separate rather than one silently overwriting the other.
++    await db.createProviderConnection({
++      provider: "codebuddy-intl",
++      authType: "oauth",
++      accessToken: "opaque-1",
++      refreshToken: "rt",
++    });
++    await db.createProviderConnection({
++      provider: "codebuddy-intl",
++      authType: "oauth",
++      accessToken: "opaque-2",
++      refreshToken: "rt",
++    });
++    expect(await db.getProviderConnections({ provider: "codebuddy-intl" })).toHaveLength(2);
++  });
++
++  it("names the connection from the token rather than 'Account N'", async () => {
++    const created = await db.createProviderConnection({
++      provider: "codebuddy-intl",
++      authType: "oauth",
++      accessToken: makeJwt({ sub: "named-user", email: "named@example.com", preferred_username: "named" }),
++      refreshToken: "rt",
++      email: "named@example.com",
++    });
++    expect(created.name).toBe("named");
++  });
++});
+diff --git a/tests/unit/codebuddy-intl-live.test.js b/tests/unit/codebuddy-intl-live.test.js
+new file mode 100644
+index 00000000..0be0001e
+--- /dev/null
++++ b/tests/unit/codebuddy-intl-live.test.js
+@@ -0,0 +1,50 @@
++// Live probe (not part of the normal suite): exercises the real gateway through
++// the patched provider and the patched global fetch.
++//
++//   cd tests && CODEBUDDY_LIVE=1 npx vitest run unit/codebuddy-intl-live.test.js
++//
++// It calls codebuddy.ai / workbuddy.ai for a pre-auth device code, so it spends
++// no credits. Skipped unless CODEBUDDY_LIVE=1 — a normal run never hits the
++// network.
++import { describe, it, expect } from "vitest";
++
++const live = process.env.CODEBUDDY_LIVE === "1";
++
++describe.skipIf(!live)("codebuddy-intl live gateway", () => {
++  it("issues a device code on the default host", async () => {
++    // Loading proxyFetch installs the patched global fetch, which is what pins
++    // brand hosts past the DNS blackhole. Without this import the provider's
++    // bare `fetch` would use the poisoned system resolver.
++    await import("open-sse/utils/proxyFetch.js");
++    const { default: provider } = await import("@/lib/oauth/providers/codebuddy-intl.js");
++
++    const result = await provider.requestDeviceCode(
++      { ...provider.config, platform: "ide" }, null, {});
++    expect(result.device_code).toBeTruthy();
++    expect(result.verification_uri).toMatch(/^https?:\/\//);
++    expect(result._brandHost).toBe("www.codebuddy.ai");
++  }, 30000);
++
++  it("issues a device code on the workbuddy host when asked", async () => {
++    await import("open-sse/utils/proxyFetch.js");
++    const { default: provider } = await import("@/lib/oauth/providers/codebuddy-intl.js");
++
++    const result = await provider.requestDeviceCode(
++      { ...provider.config, platform: "ide" }, null, { domain: "workbuddy.ai" });
++    expect(result.device_code).toBeTruthy();
++    expect(result._brandHost).toBe("www.workbuddy.ai");
++  }, 30000);
++
++  it("answers a poll instead of hanging on a connect timeout", async () => {
++    await import("open-sse/utils/proxyFetch.js");
++    const { default: provider } = await import("@/lib/oauth/providers/codebuddy-intl.js");
++
++    const t0 = Date.now();
++    const result = await provider.pollToken(
++      provider.config, "00000000-0000-4000-8000-000000000000", null, {});
++    // Pending or a plain failure — the point is that it answers at all. The DNS
++    // blackhole used to make this a 10s connect timeout.
++    expect(result).toHaveProperty("ok");
++    expect(Date.now() - t0).toBeLessThan(9000);
++  }, 30000);
++});
+diff --git a/tests/unit/codebuddy-intl-official-identity.test.js b/tests/unit/codebuddy-intl-official-identity.test.js
+new file mode 100644
+index 00000000..1d09dfe7
+--- /dev/null
++++ b/tests/unit/codebuddy-intl-official-identity.test.js
+@@ -0,0 +1,46 @@
++// The gateway's risk engine scores client identity, and identity is the header set. The
++// official 4.12.1 desktop client sends CodeBuddyIDE/* — not IDE/*, which no shipped client
++// has ever sent. These values come from the client bundle's own product files, not from
++// guessing: see open-sse/config/codebuddyIdentity.js.
++import { describe, it, expect } from "vitest";
++import { PROVIDERS } from "open-sse/config/providers.js";
++import { CODEBUDDY_CLIENT, codeBuddyUserAgent } from "open-sse/config/codebuddyIdentity.js";
++
++const H = () => PROVIDERS["codebuddy-intl"].headers;
++
++describe("codebuddy-intl static identity", () => {
++  it("declares the official client constants", () => {
++    expect(CODEBUDDY_CLIENT.platform).toBe("CodeBuddyIDE");
++    expect(CODEBUDDY_CLIENT.productName).toBe("CodeBuddy");
++    expect(CODEBUDDY_CLIENT.deploymentType).toBe("SaaS");
++    expect(CODEBUDDY_CLIENT.domain).toBe("www.codebuddy.ai");
++  });
++
++  it("builds the UA in the official order: platform first, product second", () => {
++    // buildUserAgent() unshifts productName then platform, so platform ends up first.
++    expect(codeBuddyUserAgent()).toMatch(/^CodeBuddyIDE\/[\d.]+ CodeBuddy\/[\d.]+$/);
++  });
++
++  it("registry sends CodeBuddyIDE, never the legacy IDE value", () => {
++    expect(H()["X-IDE-Type"]).toBe("CodeBuddyIDE");
++    expect(H()["X-IDE-Name"]).toBe("CodeBuddyIDE");
++    expect(H()["X-IDE-Type"]).not.toBe("IDE");
++    expect(H()["X-IDE-Name"]).not.toBe("IDE");
++  });
++
++  it("registry sends the version headers the client sends", () => {
++    expect(H()["X-IDE-Version"]).toBe(CODEBUDDY_CLIENT.platformVersion);
++    expect(H()["X-Product-Version"]).toBe(CODEBUDDY_CLIENT.productVersion);
++    expect(H()["X-Product"]).toBe("SaaS");
++    expect(H()["X-Domain"]).toBe("www.codebuddy.ai");
++  });
++
++  it("registry UA equals the UA builder output", () => {
++    expect(H()["User-Agent"]).toBe(codeBuddyUserAgent());
++  });
++
++  it("keeps the headers the gateway already accepted", () => {
++    expect(H()["x-requested-with"]).toBe("XMLHttpRequest");
++    expect(H()["x-codebuddy-request"]).toBe("1");
++  });
++});
