@@ -10,6 +10,7 @@ import {
 } from "../config/runtimeConfig.js";
 import { dbg } from "./debugLog.js";
 import { ensureClaudeCliVersion, applyClaudeCliVersion } from "./claudeCliVersion.js";
+import { getBrandDispatcher, isBrandHostUrl } from "./brandDns.js";
 
 const CLAUDE_UA_PROBE = /claude-cli\/\d/;
 function hasClaudeCliHeader(headers) {
@@ -557,6 +558,23 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
       console.warn(`[ProxyFetch] Proxy failed, falling back to direct: ${proxyError.message}`);
       return fetchWithTlsFallback(url, options, null, forceFreshSocket);
     }
+  }
+
+  // Brand hosts (CodeBuddy / WorkBuddy): the CDN answers the A record with the
+  // blackhole 0.0.0.1 for some resolvers, and this deployment's resolver is one
+  // that catches it — so the host is not connectable and every call dies as
+  // `fetch failed` / ConnectTimeoutError after undici's 10s timeout. The device
+  // flow reported that as "9router: no device code for codebuddy-intl". With no
+  // proxy to resolve DNS remotely, pin the socket to an address public resolvers
+  // vouch for; see brandDns.js. Only the address is pinned — TLS still verifies
+  // the URL host.
+  //
+  // Deliberately placed after the proxy branches: a configured proxy resolves
+  // DNS on its own side, where the poison does not apply, and pinning an address
+  // locally would send the request past the proxy.
+  if (!proxyUrl && isBrandHostUrl(targetUrl)) {
+    const dispatcher = await getBrandDispatcher();
+    if (dispatcher) return originalFetch(url, { ...options, dispatcher });
   }
 
   // Strict mode means "never leave over the direct IP". Reaching here with a
