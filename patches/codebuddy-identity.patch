@@ -466,18 +466,22 @@ index 00000000..5653135c
 +  return dispatcherPromise;
 +}
 diff --git a/open-sse/utils/proxyFetch.js b/open-sse/utils/proxyFetch.js
-index 199423c5..ef1d51e2 100644
+index 199423c5..81fdacdf 100644
 --- a/open-sse/utils/proxyFetch.js
 +++ b/open-sse/utils/proxyFetch.js
-@@ -10,6 +10,7 @@ import {
+@@ -10,6 +10,11 @@ import {
  } from "../config/runtimeConfig.js";
  import { dbg } from "./debugLog.js";
  import { ensureClaudeCliVersion, applyClaudeCliVersion } from "./claudeCliVersion.js";
 +import { getBrandDispatcher, isBrandHostUrl } from "./brandDns.js";
++
++// ponytail: upstream v0.5.119 dropped this capture; the brand-DNS pin below needs
++// the pre-patch fetch. Captured before patchedFetch replaces globalThis.fetch.
++const originalFetch = globalThis.fetch;
  
  const CLAUDE_UA_PROBE = /claude-cli\/\d/;
  function hasClaudeCliHeader(headers) {
-@@ -559,6 +560,23 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
+@@ -559,6 +564,23 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
      }
    }
  
