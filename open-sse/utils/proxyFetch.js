@@ -12,6 +12,10 @@ import { dbg } from "./debugLog.js";
 import { ensureClaudeCliVersion, applyClaudeCliVersion } from "./claudeCliVersion.js";
 import { getBrandDispatcher, isBrandHostUrl } from "./brandDns.js";
 
+// ponytail: upstream v0.5.119 dropped this capture; the brand-DNS pin below needs
+// the pre-patch fetch. Captured before patchedFetch replaces globalThis.fetch.
+const originalFetch = globalThis.fetch;
+
 const CLAUDE_UA_PROBE = /claude-cli\/\d/;
 function hasClaudeCliHeader(headers) {
   if (!headers) return false;
