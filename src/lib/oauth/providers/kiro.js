@@ -1,5 +1,15 @@
 import { KIRO_CONFIG, assertValidAwsRegion } from "../constants/oauth.js";
 import { extractEmailFromAccessToken } from "../providerHelpers.js";
+import { proxyAwareFetch } from "open-sse/utils/proxyFetch.js";
+
+// ponytail: endpoint OIDC AWS kadang memutus TLS (ECONNRESET) dari IP host tertentu —
+// termasuk VPS kita. Set OAUTH_PROXY_URL (mis. proxy residensial) untuk melewatkan
+// handshake OAuth via proxy; kosong = perilaku vanilla, langsung.
+const oauthProxyOptions = () => {
+  const url = process.env.OAUTH_PROXY_URL || process.env.oauth_proxy_url;
+  return url ? { enabled: true, url } : null;
+};
+const oauthFetch = (url, options) => proxyAwareFetch(url, options, oauthProxyOptions());
 
 const kiro = {
   config: KIRO_CONFIG,
@@ -16,7 +26,7 @@ const kiro = {
     const deviceAuthUrl = `https://oidc.${region}.amazonaws.com/device_authorization`;
 
     // Step 1: Register client with AWS SSO OIDC
-    const registerRes = await fetch(registerClientUrl, {
+    const registerRes = await oauthFetch(registerClientUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -39,7 +49,7 @@ const kiro = {
     const clientInfo = await registerRes.json();
 
     // Step 2: Request device authorization
-    const deviceRes = await fetch(deviceAuthUrl, {
+    const deviceRes = await oauthFetch(deviceAuthUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -79,7 +89,7 @@ const kiro = {
     const region = extraData?._region || "us-east-1";
     assertValidAwsRegion(region);
     const tokenUrl = `https://oidc.${region}.amazonaws.com/token`;
-    const response = await fetch(tokenUrl, {
+    const response = await oauthFetch(tokenUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
