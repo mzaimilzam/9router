@@ -84,6 +84,7 @@ Rilis + deploy (tag GHCR = versi TANPA huruf v):
   # WAJIB uji inferensi live sesudahnya — rebase bisa lolos CI tapi meledak saat call:
   python3 /tmp/r9_models.py "tokenharbor/deepseek-v4.1-flash:free" "cbai/glm-5.2"
 
-Catatan: cbai/* balas 403 code 11140 "request illegal" dari WAF Tencent itu kondisi
-bawaan provider (terbukti sama di 0.5.113 & 0.5.119-mz.1), bukan regresi rebase.
+Catatan: cbai/* balas 403 code 11140 "request illegal" itu BANNED DARI SONONYA
+(provider/WAF Tencent) — terbukti sama di 0.5.113 & 0.5.119-mz.1. Jangan diselidiki
+lagi sebagai bug rebase.
 EOF
